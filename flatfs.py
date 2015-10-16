@@ -43,7 +43,7 @@ class Passthrough(Operations):
 
         hash_path = _hash_path("/")
 
-        # Insert a row of data
+        # Insert a row for root directory
         c.execute("INSERT INTO handles VALUES (?,?,?,?)", (hash_path, "/", None, 1))
 
         # Save (commit) the changes
@@ -56,10 +56,13 @@ class Passthrough(Operations):
 
         return path
 
+    def _is_dir(self, path):
+        handle = self._get_handle(path)
+        return handle is not None and handle[3]
+
     def _get_handle(self, path):
         c = self.conn.cursor()
 
-        # Create table
         c.execute('''SELECT * FROM handles
                      WHERE hash=?''', (_hash_path(path),))
 
@@ -109,21 +112,25 @@ class Passthrough(Operations):
             raise FuseOSError(errno.EACCES)
 
     def chmod(self, path, mode):
+        if self._is_dir(path):
+            return
         full_path = self._full_path(path)
         return os.chmod(full_path, mode)
 
     def chown(self, path, uid, gid):
+        if self._is_dir(path):
+            return
         full_path = self._full_path(path)
         return os.chown(full_path, uid, gid)
 
     def getattr(self, path, fh=None):
-        handle = self._get_handle(path)
-        if handle is not None and handle[3]:
-            return dict(st_mode=(S_IFDIR | 0755), st_nlink=2)
+        if self._is_dir(path):
+            st = os.lstat(self.root)
         else:
             st = os.lstat(self._full_path(path))
-            return dict((key, getattr(st, key)) for key in
-                        ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+
+        return dict((key, getattr(st, key)) for key in
+                    ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
     def readdir(self, path, fh):
         dirents = ['.', '..']
@@ -132,12 +139,7 @@ class Passthrough(Operations):
             yield r
 
     def readlink(self, path):
-        pathname = os.readlink(self._full_path(path))
-        if pathname.startswith("/"):
-            # Path name is absolute, sanitize it.
-            return os.path.relpath(pathname, self.root)
-        else:
-            return pathname
+        return os.readlink(self._full_path(path))
 
     def mknod(self, path, mode, dev):
         return os.mknod(self._full_path(path), mode, dev)
@@ -150,13 +152,8 @@ class Passthrough(Operations):
         handle = self._get_handle(path)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
-
-        # noinspection PyNoneFunctionAssignment
-        res = os.mkdir(self._full_path(path), mode)
-
+        os.mkdir(self._full_path(path), mode)
         self._create_handle(path, True)
-
-        return res
 
     def statfs(self, path):
         full_path = self._full_path(path)
@@ -170,7 +167,11 @@ class Passthrough(Operations):
         return os.unlink(self._full_path(path))
 
     def symlink(self, name, target):
-        return os.symlink(name, self._full_path(target))
+        handle = self._get_handle(name)
+        if handle is not None:
+            raise FuseOSError(errno.ENOANO)
+        os.symlink(target, self._full_path(name))
+        self._create_handle(name, False)
 
     def rename(self, old, new):
         return os.rename(self._full_path(old), self._full_path(new))
@@ -179,6 +180,8 @@ class Passthrough(Operations):
         return os.link(self._full_path(target), self._full_path(name))
 
     def utimens(self, path, times=None):
+        if self._is_dir(path):
+            return os.utime(self._full_path(self.root), times)
         return os.utime(self._full_path(path), times)
 
     # File methods
@@ -190,15 +193,10 @@ class Passthrough(Operations):
 
     def create(self, path, mode, fi=None):
         handle = self._get_handle(path)
-
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
-
-        res = os.open(self._full_path(path), os.O_WRONLY | os.O_CREAT, mode)
-
+        os.open(self._full_path(path), os.O_WRONLY | os.O_CREAT, mode)
         self._create_handle(path, False)
-
-        return res
 
     def read(self, path, length, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
