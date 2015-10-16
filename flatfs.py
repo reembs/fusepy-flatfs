@@ -6,16 +6,22 @@ import os
 import sys
 import errno
 import sqlite3
-from stat import S_IFDIR
-from time import time
 
 from fuse import FUSE, FuseOSError, Operations
 
 
 def _hash_path(partial):
-    return hashlib.sha224(partial).hexdigest()
+    return hashlib.sha224(partial.encode('utf-8')).hexdigest()
 
 
+def _split_path(path):
+    path_split = path[1:].split('/')
+    parent = "/" + "/".join(path_split[:-1])
+    name = path_split[-1]
+    return name, parent
+
+
+# noinspection PyNoneFunctionAssignment
 class Passthrough(Operations):
     def __init__(self, root):
         self.root = root
@@ -83,7 +89,7 @@ class Passthrough(Operations):
 
         row = c.fetchone()
         while row is not None:
-            res.append(row[2][1:] + row[1])
+            res.append(row[1])
             row = c.fetchone()
 
         return res
@@ -91,17 +97,26 @@ class Passthrough(Operations):
     def _create_handle(self, path, is_dir):
         c = self.conn.cursor()
 
-        path_split = path[1:].split('/')
-
-        parent = "/" + "/".join(path_split[:-1])
-        name = path_split[-1]
+        name, parent = _split_path(path)
 
         dir_flag = 0
         if is_dir:
             dir_flag = 1
 
         c.execute("INSERT INTO handles VALUES (?,?,?,?)", (_hash_path(path), name, parent, dir_flag))
+        self.conn.commit()
 
+    def _rename_handle(self, old, new):
+        c = self.conn.cursor()
+        name, parent = _split_path(new)
+        c.execute('''UPDATE handles SET hash=?, name=? WHERE hash=?''', (_hash_path(new), name, _hash_path(old)))
+        c.fetchone()
+        self.conn.commit()
+
+    def _remove_handle(self, path):
+        c = self.conn.cursor()
+        c.execute('''DELETE FROM handles WHERE hash=?''', (_hash_path(path),))
+        c.fetchone()
         self.conn.commit()
 
     # Filesystem methods
@@ -145,36 +160,50 @@ class Passthrough(Operations):
         return os.mknod(self._full_path(path), mode, dev)
 
     def rmdir(self, path):
-        full_path = self._full_path(path)
-        return os.rmdir(full_path)
+        list_dir = self._list_dir(path)
+        if len(list_dir) > 0:
+            raise FuseOSError(errno.ENOANO)
+        self._remove_handle(path)
 
     def mkdir(self, path, mode):
         handle = self._get_handle(path)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
-        os.mkdir(self._full_path(path), mode)
         self._create_handle(path, True)
+        return
 
     def statfs(self, path):
-        full_path = self._full_path(path)
-        stv = os.statvfs(full_path)
+        if self._is_dir(path):
+            stv = os.statvfs(self.root)
+        else:
+            full_path = self._full_path(path)
+            stv = os.statvfs(full_path)
+
         return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
                                                          'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files',
                                                          'f_flag',
                                                          'f_frsize', 'f_namemax'))
 
     def unlink(self, path):
-        return os.unlink(self._full_path(path))
+        res = os.unlink(self._full_path(path))
+        self._remove_handle(path)
+        return res
 
     def symlink(self, name, target):
         handle = self._get_handle(name)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
-        os.symlink(target, self._full_path(name))
+        res = os.symlink(target, self._full_path(name))
         self._create_handle(name, False)
+        return res
 
     def rename(self, old, new):
-        return os.rename(self._full_path(old), self._full_path(new))
+        handle = self._get_handle(old)
+        if handle is None:
+            raise FuseOSError(errno.ENOANO)
+        res = os.rename(self._full_path(old), self._full_path(new))
+        self._rename_handle(old, new)
+        return res
 
     def link(self, target, name):
         return os.link(self._full_path(target), self._full_path(name))
@@ -195,8 +224,9 @@ class Passthrough(Operations):
         handle = self._get_handle(path)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
-        os.open(self._full_path(path), os.O_WRONLY | os.O_CREAT, mode)
+        res = os.open(self._full_path(path), os.O_WRONLY | os.O_CREAT, mode)
         self._create_handle(path, False)
+        return res
 
     def read(self, path, length, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
@@ -220,9 +250,8 @@ class Passthrough(Operations):
     def fsync(self, path, fdatasync, fh):
         return self.flush(path, fh)
 
-
 def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True, debug=True)
+    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True, debug=False)
 
 
 if __name__ == '__main__':
