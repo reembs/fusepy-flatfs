@@ -210,7 +210,7 @@ class Passthrough(Operations):
 
     def utimens(self, path, times=None):
         if self._is_dir(path):
-            return os.utime(self._full_path(self.root), times)
+            return os.utime(self.root, times)
         return os.utime(self._full_path(path), times)
 
     # File methods
