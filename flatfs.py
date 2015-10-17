@@ -266,7 +266,7 @@ class FlatFS(Operations):
         return self.flush(path, fh)
 
 def main(mountpoint, root):
-    FUSE(FlatFS(root), mountpoint, nothreads=True, foreground=True, debug=False)
+    FUSE(FlatFS(root), mountpoint, nothreads=True, foreground=False, debug=False)
 
 
 if __name__ == '__main__':
