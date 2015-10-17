@@ -3,9 +3,12 @@
 from __future__ import with_statement
 import hashlib
 import os
+import pickle
+from stat import S_IFDIR
 import sys
 import errno
 import sqlite3
+from time import time
 
 from fuse import FUSE, FuseOSError, Operations
 
@@ -21,12 +24,16 @@ def _split_path(path):
     return name, parent
 
 
-# noinspection PyNoneFunctionAssignment
+# noinspection PyNoneFunctionAssignment,PyMethodMayBeStatic
 class FlatFS(Operations):
     def __init__(self, root):
         self.root = root
 
         db_path = self.root + '/.flatfs_structure.sqlite'
+
+        st_dict = self._get_st_dict(os.lstat(self.root))
+        self.gid = st_dict['st_gid']
+        self.uid = st_dict['st_uid']
 
         if not os.path.isfile(db_path):
             files = os.listdir(root)
@@ -39,7 +46,7 @@ class FlatFS(Operations):
             self.conn = sqlite3.connect(db_path)
 
     def __del__(self):
-        self.vacuum()
+        self._vacuum_db()
 
     # Helpers
     # =======
@@ -51,15 +58,18 @@ class FlatFS(Operations):
                      hash text NOT NULL UNIQUE,
                      name text NOT NULL,
                      parent_path text,
-                     is_dir integer NOT NULL);''')
+                     is_dir integer NOT NULL,
+                     dir_stv text);''')
 
         c.execute('''CREATE INDEX index_hash ON handles (hash);''')
         c.execute('''CREATE INDEX index_parent_path ON handles (parent_path);''')
 
         hash_path = _hash_path("/")
 
+        stv = self._get_st_dict(os.lstat(self.root))
+
         # Insert a row for root directory
-        c.execute("INSERT INTO handles VALUES (?,?,?,?)", (hash_path, "/", None, 1))
+        c.execute("INSERT INTO handles VALUES (?,?,?,?,?)", (hash_path, "/", None, 1, pickle.dumps(stv)))
 
         # Save (commit) the changes
         self.conn.commit()
@@ -73,6 +83,9 @@ class FlatFS(Operations):
 
     def _is_dir(self, path):
         handle = self._get_handle(path)
+        return self._is_dir_handle(handle)
+
+    def _is_dir_handle(self, handle):
         return handle is not None and handle[3]
 
     def _get_handle(self, path):
@@ -103,7 +116,7 @@ class FlatFS(Operations):
 
         return res
 
-    def _create_handle(self, path, is_dir):
+    def _create_handle(self, path, is_dir, dir_stv=None):
         c = self.conn.cursor()
 
         name, parent = _split_path(path)
@@ -112,7 +125,9 @@ class FlatFS(Operations):
         if is_dir:
             dir_flag = 1
 
-        c.execute("INSERT INTO handles VALUES (?,?,?,?)", (_hash_path(path), name, parent, dir_flag))
+        encoded_dir_stv = pickle.dumps(dir_stv)
+
+        c.execute("INSERT INTO handles VALUES (?,?,?,?,?)", (_hash_path(path), name, parent, dir_flag, encoded_dir_stv))
         self.conn.commit()
 
     def _rename_handle(self, old, new):
@@ -122,17 +137,37 @@ class FlatFS(Operations):
         c.fetchone()
         self.conn.commit()
 
+    def _update_dir_stv(self, handle, new_stv):
+        c = self.conn.cursor()
+
+        new_stv_encoded = pickle.dumps(new_stv)
+
+        c.execute('''UPDATE handles SET dir_stv=? WHERE hash=?''', (new_stv_encoded, handle[0]))
+        c.fetchone()
+        self.conn.commit()
+
     def _remove_handle(self, path):
         c = self.conn.cursor()
         c.execute('''DELETE FROM handles WHERE hash=?''', (_hash_path(path),))
         c.fetchone()
         self.conn.commit()
 
-    def vacuum(self):
+    def _vacuum_db(self):
         c = self.conn.cursor()
-        c.execute('''VACUUM;''')
+        c.execute('VACUUM;')
         c.fetchone()
         self.conn.commit()
+
+    def _get_dir_stv(self, handle):
+        return pickle.loads(handle[4])
+
+    def _create_new_dir_st(self, mode):
+        return dict(st_mode=(S_IFDIR | mode), st_nlink=2, st_size=0, st_ctime=time(), st_mtime=time(), st_atime=time(),
+                    st_gid=self.gid, st_uid=self.uid)
+
+    def _get_st_dict(self, st):
+        return dict((key, getattr(st, key)) for key in
+                    ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
     # Filesystem methods
     # ==================
@@ -142,25 +177,34 @@ class FlatFS(Operations):
             raise FuseOSError(errno.EACCES)
 
     def chmod(self, path, mode):
-        if self._is_dir(path):
-            return
+        handle = self._get_handle(path)
+        if self._is_dir_handle(handle):
+            stv = self._get_dir_stv(handle)
+            stv['st_mode'] &= 0770000
+            stv['st_mode'] |= mode
+            self._update_dir_stv(handle, stv)
+            return 0
         full_path = self._full_path(path)
         return os.chmod(full_path, mode)
 
     def chown(self, path, uid, gid):
-        if self._is_dir(path):
-            return
+        handle = self._get_handle(path)
+        if self._is_dir_handle(handle):
+            stv = self._get_dir_stv(handle)
+            stv['st_uid'] = uid
+            stv['st_gid'] = gid
+            self._update_dir_stv(handle, stv)
+            return 0
         full_path = self._full_path(path)
         return os.chown(full_path, uid, gid)
 
     def getattr(self, path, fh=None):
-        if self._is_dir(path):
-            st = os.lstat(self.root)
+        handle = self._get_handle(path)
+        if self._is_dir_handle(handle):
+            return self._get_dir_stv(handle)
         else:
             st = os.lstat(self._full_path(path))
-
-        return dict((key, getattr(st, key)) for key in
-                    ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+            return self._get_st_dict(st)
 
     def readdir(self, path, fh):
         dirents = ['.', '..']
@@ -184,11 +228,12 @@ class FlatFS(Operations):
         handle = self._get_handle(path)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
-        self._create_handle(path, True)
+        self._create_handle(path, True, dir_stv=self._create_new_dir_st(mode))
         return
 
     def statfs(self, path):
-        if self._is_dir(path):
+        handle = self._get_handle(path)
+        if self._is_dir_handle(handle):
             stv = os.statvfs(self.root)
         else:
             full_path = self._full_path(path)
@@ -224,8 +269,14 @@ class FlatFS(Operations):
         return os.link(self._full_path(target), self._full_path(name))
 
     def utimens(self, path, times=None):
-        if self._is_dir(path):
-            return os.utime(self.root, times)
+        handle = self._get_handle(path)
+        if self._is_dir_handle(handle):
+            stv = self._get_dir_stv(handle)
+            atime, mtime = times if times else (time(), time())
+            stv['st_atime'] = atime
+            stv['st_mtime'] = mtime
+            self._update_dir_stv(handle, stv)
+            return
         return os.utime(self._full_path(path), times)
 
     # File methods
@@ -265,8 +316,9 @@ class FlatFS(Operations):
     def fsync(self, path, fdatasync, fh):
         return self.flush(path, fh)
 
+
 def main(mountpoint, root):
-    FUSE(FlatFS(root), mountpoint, nothreads=True, foreground=False, debug=False)
+    FUSE(FlatFS(root), mountpoint, nothreads=True, foreground=True, debug=False)
 
 
 if __name__ == '__main__':
