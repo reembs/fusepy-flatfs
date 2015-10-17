@@ -22,7 +22,7 @@ def _split_path(path):
 
 
 # noinspection PyNoneFunctionAssignment
-class Passthrough(Operations):
+class FlatFS(Operations):
     def __init__(self, root):
         self.root = root
 
@@ -37,6 +37,9 @@ class Passthrough(Operations):
                 raise FuseOSError(errno.ENOANO)
         else:
             self.conn = sqlite3.connect(db_path)
+
+    def __del__(self):
+        self.vacuum()
 
     # Helpers
     # =======
@@ -122,6 +125,12 @@ class Passthrough(Operations):
     def _remove_handle(self, path):
         c = self.conn.cursor()
         c.execute('''DELETE FROM handles WHERE hash=?''', (_hash_path(path),))
+        c.fetchone()
+        self.conn.commit()
+
+    def vacuum(self):
+        c = self.conn.cursor()
+        c.execute('''VACUUM;''')
         c.fetchone()
         self.conn.commit()
 
@@ -257,7 +266,7 @@ class Passthrough(Operations):
         return self.flush(path, fh)
 
 def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=False, debug=False)
+    FUSE(FlatFS(root), mountpoint, nothreads=True, foreground=True, debug=False)
 
 
 if __name__ == '__main__':
