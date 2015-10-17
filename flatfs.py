@@ -59,7 +59,8 @@ class FlatFS(Operations):
                      name text NOT NULL,
                      parent_path text,
                      is_dir integer NOT NULL,
-                     dir_stv text);''')
+                     dir_stv text,
+                     link_path text);''')
 
         c.execute('''CREATE INDEX index_hash ON handles (hash);''')
         c.execute('''CREATE INDEX index_parent_path ON handles (parent_path);''')
@@ -69,7 +70,7 @@ class FlatFS(Operations):
         stv = self._get_st_dict(os.lstat(self.root))
 
         # Insert a row for root directory
-        c.execute("INSERT INTO handles VALUES (?,?,?,?,?)", (hash_path, "/", None, 1, pickle.dumps(stv)))
+        c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", (hash_path, "/", None, 1, pickle.dumps(stv), None))
 
         # Save (commit) the changes
         self.conn.commit()
@@ -82,17 +83,20 @@ class FlatFS(Operations):
         return path
 
     def _is_dir(self, path):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         return self._is_dir_handle(handle)
 
     def _is_dir_handle(self, handle):
         return handle is not None and handle[3]
 
-    def _get_handle(self, path):
+    def _get_handle_path(self, path):
+        return self._get_handle_hash(_hash_path(path))
+
+    def _get_handle_hash(self, path_hash):
         c = self.conn.cursor()
 
         c.execute('''SELECT * FROM handles
-                     WHERE hash=?''', (_hash_path(path),))
+                     WHERE hash=?''', (path_hash,))
 
         row = c.fetchone()
         if row is not None:
@@ -116,7 +120,7 @@ class FlatFS(Operations):
 
         return res
 
-    def _create_handle(self, path, is_dir, dir_stv=None):
+    def _create_handle(self, path, is_dir, dir_stv=None, link_path=None):
         c = self.conn.cursor()
 
         name, parent = _split_path(path)
@@ -125,9 +129,13 @@ class FlatFS(Operations):
         if is_dir:
             dir_flag = 1
 
-        encoded_dir_stv = pickle.dumps(dir_stv)
+        encoded_dir_stv = None
+        if dir_stv is not None:
+            encoded_dir_stv = pickle.dumps(dir_stv)
 
-        c.execute("INSERT INTO handles VALUES (?,?,?,?,?)", (_hash_path(path), name, parent, dir_flag, encoded_dir_stv))
+        c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)",
+                  (_hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path))
+
         self.conn.commit()
 
     def _rename_handle(self, old, new):
@@ -177,7 +185,7 @@ class FlatFS(Operations):
             raise FuseOSError(errno.EACCES)
 
     def chmod(self, path, mode):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if self._is_dir_handle(handle):
             stv = self._get_dir_stv(handle)
             stv['st_mode'] &= 0770000
@@ -188,7 +196,7 @@ class FlatFS(Operations):
         return os.chmod(full_path, mode)
 
     def chown(self, path, uid, gid):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if self._is_dir_handle(handle):
             stv = self._get_dir_stv(handle)
             stv['st_uid'] = uid
@@ -199,7 +207,7 @@ class FlatFS(Operations):
         return os.chown(full_path, uid, gid)
 
     def getattr(self, path, fh=None):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if self._is_dir_handle(handle):
             return self._get_dir_stv(handle)
         else:
@@ -213,7 +221,13 @@ class FlatFS(Operations):
             yield r
 
     def readlink(self, path):
-        return os.readlink(self._full_path(path))
+        link_path = os.readlink(self._full_path(path))
+
+        handle = self._get_handle_hash(link_path)
+        if handle is not None:
+            return handle[5]
+
+        return link_path
 
     def mknod(self, path, mode, dev):
         return os.mknod(self._full_path(path), mode, dev)
@@ -225,14 +239,14 @@ class FlatFS(Operations):
         self._remove_handle(path)
 
     def mkdir(self, path, mode):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
         self._create_handle(path, True, dir_stv=self._create_new_dir_st(mode))
         return
 
     def statfs(self, path):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if self._is_dir_handle(handle):
             stv = os.statvfs(self.root)
         else:
@@ -250,15 +264,12 @@ class FlatFS(Operations):
         return res
 
     def symlink(self, name, target):
-        handle = self._get_handle(name)
-        if handle is not None:
-            raise FuseOSError(errno.ENOANO)
         res = os.symlink(target, self._full_path(name))
-        self._create_handle(name, False)
+        self._create_handle(name, False, link_path=target)
         return res
 
     def rename(self, old, new):
-        handle = self._get_handle(old)
+        handle = self._get_handle_path(old)
         if handle is None:
             raise FuseOSError(errno.ENOANO)
         res = os.rename(self._full_path(old), self._full_path(new))
@@ -269,7 +280,7 @@ class FlatFS(Operations):
         return os.link(self._full_path(target), self._full_path(name))
 
     def utimens(self, path, times=None):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if self._is_dir_handle(handle):
             stv = self._get_dir_stv(handle)
             atime, mtime = times if times else (time(), time())
@@ -277,6 +288,9 @@ class FlatFS(Operations):
             stv['st_mtime'] = mtime
             self._update_dir_stv(handle, stv)
             return
+        elif handle[5] is not None:
+            return os.utime(handle[5], times)
+
         return os.utime(self._full_path(path), times)
 
     # File methods
@@ -287,7 +301,7 @@ class FlatFS(Operations):
         return os.open(full_path, flags)
 
     def create(self, path, mode, fi=None):
-        handle = self._get_handle(path)
+        handle = self._get_handle_path(path)
         if handle is not None:
             raise FuseOSError(errno.ENOANO)
         res = os.open(self._full_path(path), os.O_WRONLY | os.O_CREAT, mode)
