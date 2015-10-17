@@ -44,8 +44,14 @@ class Passthrough(Operations):
         c = self.conn.cursor()
 
         # Create table
-        c.execute('''CREATE TABLE handles
-                     (hash text, name text, parent_path text, is_dir integer)''')
+        c.execute('''CREATE TABLE handles (
+                     hash text NOT NULL UNIQUE,
+                     name text NOT NULL,
+                     parent_path text,
+                     is_dir integer NOT NULL);''')
+
+        c.execute('''CREATE INDEX index_hash ON handles (hash);''')
+        c.execute('''CREATE INDEX index_parent_path ON handles (parent_path);''')
 
         hash_path = _hash_path("/")
 
@@ -251,7 +257,7 @@ class Passthrough(Operations):
         return self.flush(path, fh)
 
 def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True, debug=False)
+    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=False, debug=False)
 
 
 if __name__ == '__main__':
