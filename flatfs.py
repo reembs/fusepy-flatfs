@@ -26,8 +26,9 @@ def _split_path(path):
 
 # noinspection PyNoneFunctionAssignment,PyMethodMayBeStatic
 class FlatFS(Operations):
-    def __init__(self, root):
+    def __init__(self, root, mount_point):
         self.root = root
+        self.mount_point = mount_point
 
         db_path = self.root + '/.flatfs_structure.sqlite'
 
@@ -77,9 +78,14 @@ class FlatFS(Operations):
 
     def _full_path(self, partial):
         hash_path = _hash_path(partial)
+        path = self._get_full_path_hash(hash_path)
+        return path
 
+    def _full_path_handle(self, handle):
+        return os.path.join(self.root, handle[0])
+
+    def _get_full_path_hash(self, hash_path):
         path = os.path.join(self.root, hash_path)
-
         return path
 
     def _is_dir(self, path):
@@ -139,10 +145,14 @@ class FlatFS(Operations):
         self.conn.commit()
 
     def _rename_handle(self, old, new):
-        c = self.conn.cursor()
         name, parent = _split_path(new)
-        c.execute('''UPDATE handles SET hash=?, name=? WHERE hash=?''', (_hash_path(new), name, _hash_path(old)))
+
+        self._remove_handle(new)
+
+        c = self.conn.cursor()
+        c.execute('UPDATE handles SET hash=?, name=? WHERE hash=?', (_hash_path(new), name, _hash_path(old)))
         c.fetchone()
+
         self.conn.commit()
 
     def _update_dir_stv(self, handle, new_stv):
@@ -150,13 +160,13 @@ class FlatFS(Operations):
 
         new_stv_encoded = pickle.dumps(new_stv)
 
-        c.execute('''UPDATE handles SET dir_stv=? WHERE hash=?''', (new_stv_encoded, handle[0]))
+        c.execute('UPDATE handles SET dir_stv=? WHERE hash=?', (new_stv_encoded, handle[0]))
         c.fetchone()
         self.conn.commit()
 
     def _remove_handle(self, path):
         c = self.conn.cursor()
-        c.execute('''DELETE FROM handles WHERE hash=?''', (_hash_path(path),))
+        c.execute('DELETE FROM handles WHERE hash=?', (_hash_path(path),))
         c.fetchone()
         self.conn.commit()
 
@@ -221,13 +231,7 @@ class FlatFS(Operations):
             yield r
 
     def readlink(self, path):
-        link_path = os.readlink(self._full_path(path))
-
-        handle = self._get_handle_hash(link_path)
-        if handle is not None:
-            return handle[5]
-
-        return link_path
+        return os.readlink(self._full_path(path))
 
     def mknod(self, path, mode, dev):
         return os.mknod(self._full_path(path), mode, dev)
@@ -264,8 +268,20 @@ class FlatFS(Operations):
         return res
 
     def symlink(self, name, target):
-        res = os.symlink(target, self._full_path(name))
+        handle = self._get_handle_path(name)
+        if handle is not None:
+            raise FuseOSError(errno.ENOANO)
+
+        path = os.path.abspath(os.path.join(self.mount_point, "." + os.path.split(name)[0], target))
+
+        if path.startswith(self.mount_point):
+            fuse_path = path[len(self.mount_point):]
+            res = os.symlink(_hash_path(fuse_path), self._full_path(name))
+        else:
+            res = os.symlink(path, self._full_path(name))
+
         self._create_handle(name, False, link_path=target)
+
         return res
 
     def rename(self, old, new):
@@ -289,7 +305,7 @@ class FlatFS(Operations):
             self._update_dir_stv(handle, stv)
             return
         elif handle[5] is not None:
-            return os.utime(handle[5], times)
+            return
 
         return os.utime(self._full_path(path), times)
 
@@ -332,7 +348,7 @@ class FlatFS(Operations):
 
 
 def main(mountpoint, root):
-    FUSE(FlatFS(root), mountpoint, nothreads=True, foreground=True, debug=False)
+    FUSE(FlatFS(root, mountpoint), mountpoint, nothreads=True, foreground=True, debug=False)
 
 
 if __name__ == '__main__':
