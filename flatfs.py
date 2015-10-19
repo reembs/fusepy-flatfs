@@ -9,6 +9,7 @@ import sys
 import errno
 import sqlite3
 from time import time
+import pylru
 
 from fuse import FUSE, FuseOSError, Operations
 
@@ -36,6 +37,9 @@ class FlatFS(Operations):
         self.gid = st_dict['st_gid']
         self.uid = st_dict['st_uid']
 
+        self.handle_cache = pylru.lrucache(10000)
+        self.dirs_cache = pylru.lrucache(100)
+
         if not os.path.isfile(db_path):
             files = os.listdir(root)
             if len(files) == 0:
@@ -45,6 +49,12 @@ class FlatFS(Operations):
                 raise FuseOSError(errno.ENOANO)
         else:
             self.conn = sqlite3.connect(db_path)
+
+        handle = self._get_handle_path('/')
+        if handle is None:
+            raise FuseOSError(errno.ENOANO)
+
+        self.handle_cache[handle[0]] = handle
 
     def __del__(self):
         self._vacuum_db()
@@ -99,6 +109,9 @@ class FlatFS(Operations):
         return self._get_handle_hash(_hash_path(path))
 
     def _get_handle_hash(self, path_hash):
+        if path_hash in self.handle_cache:
+            return self.handle_cache[path_hash]
+
         c = self.conn.cursor()
 
         c.execute('''SELECT * FROM handles
@@ -139,8 +152,9 @@ class FlatFS(Operations):
         if dir_stv is not None:
             encoded_dir_stv = pickle.dumps(dir_stv)
 
-        c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)",
-                  (_hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path))
+        handle = (_hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path)
+        c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", handle)
+        self.handle_cache[handle[0]] = handle
 
         self.conn.commit()
 
@@ -149,8 +163,12 @@ class FlatFS(Operations):
 
         self._remove_handle(new)
 
+        old_hash = _hash_path(old)
+        if old_hash in self.handle_cache:
+            del self.handle_cache[old_hash]
+
         c = self.conn.cursor()
-        c.execute('UPDATE handles SET hash=?, name=? WHERE hash=?', (_hash_path(new), name, _hash_path(old)))
+        c.execute('UPDATE handles SET hash=?, name=? WHERE hash=?', (_hash_path(new), name, old_hash))
         c.fetchone()
 
         self.conn.commit()
@@ -166,8 +184,11 @@ class FlatFS(Operations):
 
     def _remove_handle(self, path):
         c = self.conn.cursor()
-        c.execute('DELETE FROM handles WHERE hash=?', (_hash_path(path),))
+        hash_path = _hash_path(path)
+        c.execute('DELETE FROM handles WHERE hash=?', (hash_path,))
         c.fetchone()
+        if hash_path in self.handle_cache:
+            del self.handle_cache[hash_path]
         self.conn.commit()
 
     def _vacuum_db(self):
