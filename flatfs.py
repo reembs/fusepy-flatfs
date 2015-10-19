@@ -27,7 +27,7 @@ def _split_path(path):
 
 # noinspection PyNoneFunctionAssignment,PyMethodMayBeStatic
 class FlatFS(Operations):
-    def __init__(self, root, mount_point):
+    def __init__(self, root, mount_point, in_mem):
         self.root = root
         self.mount_point = mount_point
 
@@ -40,15 +40,21 @@ class FlatFS(Operations):
         self.handle_cache = pylru.lrucache(10000)
         self.dirs_cache = pylru.lrucache(100)
 
+        self.in_mem = in_mem
+
         if not os.path.isfile(db_path):
             files = os.listdir(root)
             if len(files) == 0:
-                self.conn = sqlite3.connect(db_path)
-                self._create_structure()
+                self._create_connections(db_path)
+                self._create_structure(self.disk_conn)
             else:
                 raise FuseOSError(errno.ENOANO)
         else:
-            self.conn = sqlite3.connect(db_path)
+            self._create_connections(db_path)
+
+        if self.in_mem:
+            self._create_structure(self.conn)
+            self._flush_disk_to_mem()
 
         handle = self._get_handle_path('/')
         if handle is None:
@@ -56,13 +62,51 @@ class FlatFS(Operations):
 
         self.handle_cache[handle[0]] = handle
 
+    def _create_connections(self, db_path):
+        if self.in_mem:
+            self.disk_conn = sqlite3.connect(db_path)
+            self.conn = sqlite3.connect(":memory:")
+        else:
+            self.disk_conn = sqlite3.connect(db_path)
+
+    def _flush_disk_to_mem(self):
+        dc = self.disk_conn.cursor()
+        c = self.conn.cursor()
+
+        dc.execute("SELECT * FROM handles")
+
+        row = dc.fetchone()
+        while row is not None:
+            if row[2] is not None: # this is root dir
+                c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", row)
+                c.fetchone()
+            row = dc.fetchone()
+        self.conn.commit()
+
+    def _flush_mem_to_disk(self):
+        dc = self.disk_conn.cursor()
+        c = self.conn.cursor()
+
+        dc.execute("DELETE FROM handles")
+        dc.fetchone()
+
+        c.execute("SELECT * FROM handles")
+        row = c.fetchone()
+        while row is not None:
+            dc.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", row)
+            dc.fetchone()
+            row = c.fetchone()
+
+        self.disk_conn.commit()
+
     def __del__(self):
+        self._flush_mem_to_disk();
         self._vacuum_db()
 
     # Helpers
     # =======
-    def _create_structure(self):
-        c = self.conn.cursor()
+    def _create_structure(self, connection):
+        c = connection.cursor()
 
         # Create table
         c.execute('''CREATE TABLE handles (
@@ -84,7 +128,7 @@ class FlatFS(Operations):
         c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", (hash_path, "/", None, 1, pickle.dumps(stv), None))
 
         # Save (commit) the changes
-        self.conn.commit()
+        connection.commit()
 
     def _full_path(self, partial):
         hash_path = _hash_path(partial)
@@ -213,7 +257,7 @@ class FlatFS(Operations):
         self.conn.commit()
 
     def _vacuum_db(self):
-        c = self.conn.cursor()
+        c = self.disk_conn.cursor()
         c.execute('VACUUM;')
         c.fetchone()
         self.conn.commit()
@@ -390,7 +434,7 @@ class FlatFS(Operations):
 
 
 def main(mountpoint, root):
-    FUSE(FlatFS(root, mountpoint), mountpoint, nothreads=True, foreground=True, debug=False)
+    FUSE(FlatFS(root, mountpoint, True), mountpoint, nothreads=True, foreground=True, debug=False)
 
 
 if __name__ == '__main__':
