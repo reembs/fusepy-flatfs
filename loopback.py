@@ -2,98 +2,132 @@
 
 from __future__ import with_statement
 
-from errno import EACCES
-from os.path import realpath
-from sys import argv, exit
-from threading import Lock
-
 import os
+import sys
+import errno
 
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from fuse import FUSE, FuseOSError, Operations
 
-
-class Loopback(LoggingMixIn, Operations):
+class Passthrough(Operations):
     def __init__(self, root):
-        self.root = realpath(root)
-        self.rwlock = Lock()
+        self.root = root
 
-    def __call__(self, op, path, *args):
-        return super(Loopback, self).__call__(op, self.root + path, *args)
+    # Helpers
+    # =======
+
+    def _full_path(self, partial):
+        if partial.startswith("/"):
+            partial = partial[1:]
+        path = os.path.join(self.root, partial)
+        return path
+
+    # Filesystem methods
+    # ==================
 
     def access(self, path, mode):
-        if not os.access(path, mode):
-            raise FuseOSError(EACCES)
+        full_path = self._full_path(path)
+        if not os.access(full_path, mode):
+            raise FuseOSError(errno.EACCES)
 
-    chmod = os.chmod
-    chown = os.chown
+    def chmod(self, path, mode):
+        full_path = self._full_path(path)
+        return os.chmod(full_path, mode)
 
-    def create(self, path, mode):
-        return os.open(path, os.O_WRONLY | os.O_CREAT, mode)
-
-    def flush(self, path, fh):
-        return os.fsync(fh)
-
-    def fsync(self, path, datasync, fh):
-        return os.fsync(fh)
+    def chown(self, path, uid, gid):
+        full_path = self._full_path(path)
+        return os.chown(full_path, uid, gid)
 
     def getattr(self, path, fh=None):
-        st = os.lstat(path)
+        full_path = self._full_path(path)
+        st = os.lstat(full_path)
         return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-            'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-
-    getxattr = None
-
-    def link(self, target, source):
-        return os.link(source, target)
-
-    listxattr = None
-    mkdir = os.mkdir
-    mknod = os.mknod
-    open = os.open
-
-    def read(self, path, size, offset, fh):
-        with self.rwlock:
-            os.lseek(fh, offset, 0)
-            return os.read(fh, size)
+                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
     def readdir(self, path, fh):
-        return ['.', '..'] + os.listdir(path)
+        full_path = self._full_path(path)
 
-    readlink = os.readlink
+        dirents = ['.', '..']
+        if os.path.isdir(full_path):
+            dirents.extend(os.listdir(full_path))
+        for r in dirents:
+            yield r
 
-    def release(self, path, fh):
-        return os.close(fh)
+    def readlink(self, path):
+        pathname = os.readlink(self._full_path(path))
+        if pathname.startswith("/"):
+            # Path name is absolute, sanitize it.
+            return os.path.relpath(pathname, self.root)
+        else:
+            return pathname
 
-    def rename(self, old, new):
-        return os.rename(old, self.root + new)
+    def mknod(self, path, mode, dev):
+        return os.mknod(self._full_path(path), mode, dev)
 
-    rmdir = os.rmdir
+    def rmdir(self, path):
+        full_path = self._full_path(path)
+        return os.rmdir(full_path)
+
+    def mkdir(self, path, mode):
+        return os.mkdir(self._full_path(path), mode)
 
     def statfs(self, path):
-        stv = os.statvfs(path)
+        full_path = self._full_path(path)
+        stv = os.statvfs(full_path)
         return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
             'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
             'f_frsize', 'f_namemax'))
 
-    def symlink(self, target, source):
-        return os.symlink(source, target)
+    def unlink(self, path):
+        return os.unlink(self._full_path(path))
+
+    def symlink(self, name, target):
+        return os.symlink(target, self._full_path(name))
+
+    def rename(self, old, new):
+        return os.rename(self._full_path(old), self._full_path(new))
+
+    def link(self, target, name):
+        return os.link(self._full_path(target), self._full_path(name))
+
+    def utimens(self, path, times=None):
+        return 0
+
+    # File methods
+    # ============
+
+    def open(self, path, flags):
+        full_path = self._full_path(path)
+        return os.open(full_path, flags)
+
+    def create(self, path, mode, fi=None):
+        full_path = self._full_path(path)
+        return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
+
+    def read(self, path, length, offset, fh):
+        os.lseek(fh, offset, os.SEEK_SET)
+        return os.read(fh, length)
+
+    def write(self, path, buf, offset, fh):
+        os.lseek(fh, offset, os.SEEK_SET)
+        return os.write(fh, buf)
 
     def truncate(self, path, length, fh=None):
-        with open(path, 'r+') as f:
+        full_path = self._full_path(path)
+        with open(full_path, 'r+') as f:
             f.truncate(length)
 
-    unlink = os.unlink
-    utimens = os.utime
+    def flush(self, path, fh):
+        return os.fsync(fh)
 
-    def write(self, path, data, offset, fh):
-        with self.rwlock:
-            os.lseek(fh, offset, 0)
-            return os.write(fh, data)
+    def release(self, path, fh):
+        return os.close(fh)
 
+    def fsync(self, path, fdatasync, fh):
+        return self.flush(path, fh)
+
+
+def main(mountpoint, root):
+    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True)
 
 if __name__ == '__main__':
-    if len(argv) != 3:
-        print('usage: %s <root> <mountpoint>' % argv[0])
-        exit(1)
-
-    fuse = FUSE(Loopback(argv[1]), argv[2], foreground=True)
+    main(sys.argv[2], sys.argv[1])
