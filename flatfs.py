@@ -124,6 +124,9 @@ class FlatFS(Operations):
         return None
 
     def _list_dir(self, path):
+        if path in self.dirs_cache:
+            return self.dirs_cache[path]
+
         c = self.conn.cursor()
 
         # Create table
@@ -136,6 +139,8 @@ class FlatFS(Operations):
         while row is not None:
             res.append(row[1])
             row = c.fetchone()
+
+        self.dirs_cache[path] = res
 
         return res
 
@@ -154,7 +159,10 @@ class FlatFS(Operations):
 
         handle = (_hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path)
         c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", handle)
+
         self.handle_cache[handle[0]] = handle
+        if parent in self.dirs_cache:
+            del self.dirs_cache[parent]
 
         self.conn.commit()
 
@@ -167,6 +175,10 @@ class FlatFS(Operations):
         if old_hash in self.handle_cache:
             del self.handle_cache[old_hash]
 
+        parent = os.path.split(old)[0]
+        if parent in self.dirs_cache:
+            del self.dirs_cache[parent]
+
         c = self.conn.cursor()
         c.execute('UPDATE handles SET hash=?, name=? WHERE hash=?', (_hash_path(new), name, old_hash))
         c.fetchone()
@@ -178,6 +190,9 @@ class FlatFS(Operations):
 
         new_stv_encoded = pickle.dumps(new_stv)
 
+        if handle[0] in self.handle_cache:
+            del self.handle_cache[handle[0]]
+
         c.execute('UPDATE handles SET dir_stv=? WHERE hash=?', (new_stv_encoded, handle[0]))
         c.fetchone()
         self.conn.commit()
@@ -187,8 +202,14 @@ class FlatFS(Operations):
         hash_path = _hash_path(path)
         c.execute('DELETE FROM handles WHERE hash=?', (hash_path,))
         c.fetchone()
+
         if hash_path in self.handle_cache:
             del self.handle_cache[hash_path]
+
+        parent = os.path.split(path)[0]
+        if parent in self.dirs_cache:
+            del self.dirs_cache[parent]
+
         self.conn.commit()
 
     def _vacuum_db(self):
