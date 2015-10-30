@@ -1,33 +1,24 @@
 #!/usr/bin/env python
 
 from __future__ import with_statement
-import hashlib
 import os
 import pickle
 from stat import S_IFDIR
 import sys
 import errno
-import sqlite3
 from time import time
-import pylru
+from key_val_store import HandleStore
+from key_val_store import hash_path
 
 from fuse import FUSE, FuseOSError, Operations
 
-
-def _hash_path(partial):
-    return hashlib.sha224(partial.encode('utf-8')).hexdigest()
-
-
 def _split_path(path):
-    path_split = path[1:].split('/')
-    parent = "/" + "/".join(path_split[:-1])
-    name = path_split[-1]
-    return name, parent
-
+    path_split = os.path.split(path[1:])
+    return path_split[0], path_split[1]
 
 # noinspection PyNoneFunctionAssignment,PyMethodMayBeStatic
 class FlatFS(Operations):
-    def __init__(self, root, mount_point, in_mem):
+    def __init__(self, root, mount_point):
         self.root = root
         self.mount_point = mount_point
 
@@ -37,109 +28,28 @@ class FlatFS(Operations):
         self.gid = st_dict['st_gid']
         self.uid = st_dict['st_uid']
 
-        self.handle_cache = pylru.lrucache(10000)
-        self.dirs_cache = pylru.lrucache(100)
-
-        self.in_mem = in_mem
-
-        if not os.path.isfile(db_path):
-            files = os.listdir(root)
-            if len(files) == 0:
-                self._create_connections(db_path)
-                self._create_structure(self.disk_conn)
-            else:
-                raise FuseOSError(errno.ENOANO)
-        else:
-            self._create_connections(db_path)
-
-        if self.in_mem:
-            self._create_structure(self.conn)
-            self._flush_disk_to_mem()
+        stv = pickle.dumps(self._get_st_dict(os.lstat(self.root)))
+        self.store = HandleStore(db_path, stv)
 
         handle = self._get_handle_path('/')
         if handle is None:
-            raise FuseOSError(errno.ENOANO)
-
-        self.handle_cache[handle[0]] = handle
-
-    def _create_connections(self, db_path):
-        if self.in_mem:
-            self.disk_conn = sqlite3.connect(db_path)
-            self.conn = sqlite3.connect(":memory:")
-        else:
-            self.disk_conn = sqlite3.connect(db_path)
-
-    def _flush_disk_to_mem(self):
-        dc = self.disk_conn.cursor()
-        c = self.conn.cursor()
-
-        dc.execute("SELECT * FROM handles")
-
-        row = dc.fetchone()
-        while row is not None:
-            if row[2] is not None: # this is root dir
-                c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", row)
-                c.fetchone()
-            row = dc.fetchone()
-        self.conn.commit()
-
-    def _flush_mem_to_disk(self):
-        dc = self.disk_conn.cursor()
-        c = self.conn.cursor()
-
-        dc.execute("DELETE FROM handles")
-        dc.fetchone()
-
-        c.execute("SELECT * FROM handles")
-        row = c.fetchone()
-        while row is not None:
-            dc.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", row)
-            dc.fetchone()
-            row = c.fetchone()
-
-        self.disk_conn.commit()
+            handle = (hash_path('/'), '/', None, 1, stv, None)
+            self.store.add(hash_path('/'), handle)
 
     def __del__(self):
-        self._flush_mem_to_disk();
-        self._vacuum_db()
+        del self.store
 
     # Helpers
     # =======
-    def _create_structure(self, connection):
-        c = connection.cursor()
-
-        # Create table
-        c.execute('''CREATE TABLE handles (
-                     hash text NOT NULL UNIQUE,
-                     name text NOT NULL,
-                     parent_path text,
-                     is_dir integer NOT NULL,
-                     dir_stv text,
-                     link_path text);''')
-
-        c.execute('''CREATE INDEX index_hash ON handles (hash);''')
-        c.execute('''CREATE INDEX index_parent_path ON handles (parent_path);''')
-
-        hash_path = _hash_path("/")
-
-        stv = self._get_st_dict(os.lstat(self.root))
-
-        # Insert a row for root directory
-        c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", (hash_path, "/", None, 1, pickle.dumps(stv), None))
-
-        # Save (commit) the changes
-        connection.commit()
-
     def _full_path(self, partial):
-        hash_path = _hash_path(partial)
-        path = self._get_full_path_hash(hash_path)
+        path = self._get_full_path_hash(hash_path(partial))
         return path
 
     def _full_path_handle(self, handle):
         return os.path.join(self.root, handle[0])
 
-    def _get_full_path_hash(self, hash_path):
-        path = os.path.join(self.root, hash_path)
+    def _get_full_path_hash(self, _hash_path):
+        path = os.path.join(self.root, _hash_path)
         return path
 
     def _is_dir(self, path):
@@ -150,117 +60,85 @@ class FlatFS(Operations):
         return handle is not None and handle[3]
 
     def _get_handle_path(self, path):
-        return self._get_handle_hash(_hash_path(path))
+        return self._get_handle_hash(hash_path(path))
 
     def _get_handle_hash(self, path_hash):
-        if path_hash in self.handle_cache:
-            return self.handle_cache[path_hash]
-
-        c = self.conn.cursor()
-
-        c.execute('''SELECT * FROM handles
-                     WHERE hash=?''', (path_hash,))
-
-        row = c.fetchone()
-        if row is not None:
-            return row
-
-        return None
+        return self.store.get(path_hash)
 
     def _list_dir(self, path):
-        if path in self.dirs_cache:
-            return self.dirs_cache[path]
+        return self.store.get("l_" + hash_path(path))
 
-        c = self.conn.cursor()
-
-        # Create table
-        c.execute('''SELECT * FROM handles
-                     WHERE parent_path=?''', (path,))
-
-        res = []
-
-        row = c.fetchone()
-        while row is not None:
-            res.append(row[1])
-            row = c.fetchone()
-
-        self.dirs_cache[path] = res
-
-        return res
+    def _copy_handle(self, handle, key=None, name=None, stv=None):
+        if key is None:
+            key = handle[0]
+        if name is None:
+            name = handle[1]
+        if stv is None:
+            stv = handle[4]
+        return key, name, handle[2], handle[3], stv, handle[5]
 
     def _create_handle(self, path, is_dir, dir_stv=None, link_path=None):
-        c = self.conn.cursor()
-
-        name, parent = _split_path(path)
-
         dir_flag = 0
         if is_dir:
             dir_flag = 1
+
+        parent, name = _split_path(path)
 
         encoded_dir_stv = None
         if dir_stv is not None:
             encoded_dir_stv = pickle.dumps(dir_stv)
 
-        handle = (_hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path)
-        c.execute("INSERT INTO handles VALUES (?,?,?,?,?,?)", handle)
+        handle = (hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path)
 
-        self.handle_cache[handle[0]] = handle
-        if parent in self.dirs_cache:
-            del self.dirs_cache[parent]
+        self.store.add(handle[0], handle)
+        if is_dir:
+            self.store.add("l_" + handle[0], [])
 
-        self.conn.commit()
+        parent_dir_key = "l_" + hash_path("/" + handle[2])
+        _dir = self.store.get(parent_dir_key)
+        _dir.append(handle[1])
+
+        self.store.add(parent_dir_key, _dir)
+
+        return handle
 
     def _rename_handle(self, old, new):
-        name, parent = _split_path(new)
+        parent, name = _split_path(new)
 
         self._remove_handle(new)
 
-        old_hash = _hash_path(old)
-        if old_hash in self.handle_cache:
-            del self.handle_cache[old_hash]
+        parent, old_name = os.path.split(old)
 
-        parent = os.path.split(old)[0]
-        if parent in self.dirs_cache:
-            del self.dirs_cache[parent]
+        parent_hash = hash_path(parent)
+        parent_l = self.store.get("l_" + parent_hash)
+        parent_l.remove(old_name)
+        parent_l.append(name)
+        self.store.add("l_" + parent_hash, parent_l)
 
-        c = self.conn.cursor()
-        c.execute('UPDATE handles SET hash=?, name=? WHERE hash=?', (_hash_path(new), name, old_hash))
-        c.fetchone()
+        handle = self._remove_handle(old)
+        handle = self._copy_handle(handle, key=hash_path(new), name=name)
 
-        self.conn.commit()
+        self.store.add(handle[0], handle)
 
     def _update_dir_stv(self, handle, new_stv):
-        c = self.conn.cursor()
-
         new_stv_encoded = pickle.dumps(new_stv)
-
-        if handle[0] in self.handle_cache:
-            del self.handle_cache[handle[0]]
-
-        c.execute('UPDATE handles SET dir_stv=? WHERE hash=?', (new_stv_encoded, handle[0]))
-        c.fetchone()
-        self.conn.commit()
+        handle = self._copy_handle(handle, stv=new_stv_encoded)
+        self.store.add(handle[0], handle)
 
     def _remove_handle(self, path):
-        c = self.conn.cursor()
-        hash_path = _hash_path(path)
-        c.execute('DELETE FROM handles WHERE hash=?', (hash_path,))
-        c.fetchone()
+        _hash_path = hash_path(path)
 
-        if hash_path in self.handle_cache:
-            del self.handle_cache[hash_path]
+        handle = self.store.remove(_hash_path)
+        if handle is not None:
+            parent, name = os.path.split(path)
+            if handle[3] == 0:
+                parent_hash = hash_path(parent)
+                parent_l = self.store.get("l_" + parent_hash)
+                if name in parent_l:
+                    parent_l.remove(name)
+                    self.store.add("l_" + parent_hash, parent_l)
 
-        parent = os.path.split(path)[0]
-        if parent in self.dirs_cache:
-            del self.dirs_cache[parent]
-
-        self.conn.commit()
-
-    def _vacuum_db(self):
-        c = self.disk_conn.cursor()
-        c.execute('VACUUM;')
-        c.fetchone()
-        self.conn.commit()
+        return handle
 
     def _get_dir_stv(self, handle):
         return pickle.loads(handle[4])
@@ -362,7 +240,7 @@ class FlatFS(Operations):
 
         if path.startswith(self.mount_point):
             fuse_path = path[len(self.mount_point):]
-            res = os.symlink(_hash_path(fuse_path), self._full_path(name))
+            res = os.symlink(hash_path(fuse_path), self._full_path(name))
         else:
             res = os.symlink(path, self._full_path(name))
 
@@ -434,8 +312,7 @@ class FlatFS(Operations):
 
 
 def main(mountpoint, root):
-    FUSE(FlatFS(root, mountpoint, True), mountpoint, nothreads=True, foreground=True, debug=False)
-
+    FUSE(FlatFS(root, mountpoint), mountpoint, nothreads=True, foreground=True, debug=False)
 
 if __name__ == '__main__':
     main(sys.argv[2], sys.argv[1])
