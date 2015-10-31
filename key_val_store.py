@@ -7,6 +7,8 @@ import pylru
 
 from unqlite import UnQLite
 
+CACHE_SIZE = 50000
+
 def hash_path(partial):
     return hashlib.sha224(partial.encode('utf-8')).hexdigest()
 
@@ -23,6 +25,8 @@ class HandleStore:
                 raise FuseOSError(errno.ENOANO)
         else:
             self._create_connections(path)
+
+        self._pre_populate_cache()
 
     def __del__(self):
         pass
@@ -58,4 +62,12 @@ class HandleStore:
 
     def _create_connections(self, db_path):
         self._store = UnQLite(db_path)
-        self.cache = pylru.lrucache(50000)
+        self.cache = pylru.lrucache(CACHE_SIZE)
+
+    def _pre_populate_cache(self):
+        i = 0
+        for (key, val) in self._store:
+            self.cache[key] = pickle.loads(val)
+            i += 1
+            if i >= CACHE_SIZE:
+                break
