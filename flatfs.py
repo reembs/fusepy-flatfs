@@ -36,6 +36,9 @@ class FlatFS(Operations):
             handle = (hash_path('/'), '/', None, 1, stv, None)
             self.store.add(hash_path('/'), handle)
 
+    def init(self, path):
+        super(FlatFS, self).init(path)
+
     def __del__(self):
         del self.store
 
