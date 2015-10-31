@@ -2,7 +2,6 @@
 
 from __future__ import with_statement
 import os
-import pickle
 from stat import S_IFDIR
 import sys
 import errno
@@ -22,19 +21,20 @@ class FlatFS(Operations):
         self.root = root
         self.mount_point = mount_point
 
-        db_path = self.root + '/.flatfs_structure.sqlite'
+        db_path = self.root + '/.store.unqlite'
 
         st_dict = self._get_st_dict(os.lstat(self.root))
         self.gid = st_dict['st_gid']
         self.uid = st_dict['st_uid']
 
-        stv = pickle.dumps(self._get_st_dict(os.lstat(self.root)))
+        stv = self._get_st_dict(os.lstat(self.root))
+
         self.store = HandleStore(db_path, stv)
 
         handle = self._get_handle_path('/')
         if handle is None:
             handle = (hash_path('/'), '/', None, 1, stv, None)
-            self.store.add(hash_path('/'), handle)
+            self.store.put(hash_path('/'), handle)
 
     def init(self, path):
         super(FlatFS, self).init(path)
@@ -87,21 +87,17 @@ class FlatFS(Operations):
 
         parent, name = _split_path(path)
 
-        encoded_dir_stv = None
-        if dir_stv is not None:
-            encoded_dir_stv = pickle.dumps(dir_stv)
+        handle = (hash_path(path), name, parent, dir_flag, dir_stv, link_path)
 
-        handle = (hash_path(path), name, parent, dir_flag, encoded_dir_stv, link_path)
-
-        self.store.add(handle[0], handle)
+        self.store.put(handle[0], handle)
         if is_dir:
-            self.store.add("l_" + handle[0], [])
+            self.store.put("l_" + handle[0], [])
 
         parent_dir_key = "l_" + hash_path("/" + handle[2])
         _dir = self.store.get(parent_dir_key)
         _dir.append(handle[1])
 
-        self.store.add(parent_dir_key, _dir)
+        self.store.put(parent_dir_key, _dir)
 
         return handle
 
@@ -116,17 +112,16 @@ class FlatFS(Operations):
         parent_l = self.store.get("l_" + parent_hash)
         parent_l.remove(old_name)
         parent_l.append(name)
-        self.store.add("l_" + parent_hash, parent_l)
+        self.store.put("l_" + parent_hash, parent_l)
 
         handle = self._remove_handle(old)
         handle = self._copy_handle(handle, key=hash_path(new), name=name)
 
-        self.store.add(handle[0], handle)
+        self.store.put(handle[0], handle)
 
     def _update_dir_stv(self, handle, new_stv):
-        new_stv_encoded = pickle.dumps(new_stv)
-        handle = self._copy_handle(handle, stv=new_stv_encoded)
-        self.store.add(handle[0], handle)
+        handle = self._copy_handle(handle, stv=new_stv)
+        self.store.put(handle[0], handle)
 
     def _remove_handle(self, path):
         _hash_path = hash_path(path)
@@ -139,12 +134,12 @@ class FlatFS(Operations):
                 parent_l = self.store.get("l_" + parent_hash)
                 if name in parent_l:
                     parent_l.remove(name)
-                    self.store.add("l_" + parent_hash, parent_l)
+                    self.store.put("l_" + parent_hash, parent_l)
 
         return handle
 
     def _get_dir_stv(self, handle):
-        return pickle.loads(handle[4])
+        return handle[4]
 
     def _create_new_dir_st(self, mode):
         return dict(st_mode=(S_IFDIR | mode), st_nlink=2, st_size=0, st_ctime=time(), st_mtime=time(), st_atime=time(),
