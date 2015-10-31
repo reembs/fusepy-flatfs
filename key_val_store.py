@@ -85,7 +85,10 @@ class HandleStore:
                 if row[2] is None:
                     dir_key = 'l_' + hash_path("/")
                 else:
-                    dir_key = 'l_' + hash_path("/" + row[2])
+                    if row[3] == 0:
+                        dir_key = 'l_' + hash_path("/" + row[2])
+                    else:
+                        dir_key = 'l_' + row[0]
 
                 parent_l = self._store.get(dir_key, [])
 
