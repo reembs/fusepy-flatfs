@@ -41,9 +41,13 @@ class HandleStore:
         self.cache[key] = val
 
     def remove(self, key):
+        if key in self.cache:
+            del self.cache[key]
+
         res = self.get(key)
         if res is not None:
             del self._store[key]
+
         return res
 
     def _create_structure(self, stv):

@@ -129,12 +129,15 @@ class FlatFS(Operations):
         handle = self.store.remove(_hash_path)
         if handle is not None:
             parent, name = os.path.split(path)
-            if handle[3] == 0:
-                parent_hash = hash_path(parent)
-                parent_l = self.store.get("l_" + parent_hash)
-                if name in parent_l:
-                    parent_l.remove(name)
-                    self.store.put("l_" + parent_hash, parent_l)
+
+            if handle[3] == 1:
+                self.store.remove('l_' + _hash_path)
+
+            parent_hash = hash_path(parent)
+            parent_l = self.store.get("l_" + parent_hash)
+            if name in parent_l:
+                parent_l.remove(name)
+                self.store.put("l_" + parent_hash, parent_l)
 
         return handle
 
