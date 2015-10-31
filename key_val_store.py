@@ -3,6 +3,7 @@ import errno
 from fuse import FuseOSError
 import hashlib
 import pickle
+import pylru
 
 from unqlite import UnQLite
 
@@ -27,12 +28,17 @@ class HandleStore:
         pass
 
     def get(self, key, default=None):
+        if key in self.cache:
+            return self.cache[key]
         if key in self._store:
-            return pickle.loads(self._store[key])
+            value = pickle.loads(self._store[key])
+            self.cache[key] = value
+            return value
         return default
 
     def put(self, key, val):
         self._store[key] = pickle.dumps(val)
+        self.cache[key] = val
 
     def remove(self, key):
         res = self.get(key)
@@ -48,3 +54,4 @@ class HandleStore:
 
     def _create_connections(self, db_path):
         self._store = UnQLite(db_path)
+        self.cache = pylru.lrucache(50000)
