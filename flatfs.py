@@ -21,7 +21,7 @@ class FlatFS(Operations):
         self.root = root
         self.mount_point = mount_point
 
-        db_path = self.root + '/.store.unqlite'
+        db_path = self.root + '/.store.db'
 
         st_dict = self._get_st_dict(os.lstat(self.root))
         self.gid = st_dict['st_gid']

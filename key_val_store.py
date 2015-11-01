@@ -5,7 +5,7 @@ import hashlib
 import pickle
 import pylru
 
-from unqlite import UnQLite
+from bsddb3 import db
 
 CACHE_SIZE = 50000
 
@@ -29,19 +29,22 @@ class HandleStore:
         self._pre_populate_cache()
 
     def __del__(self):
-        pass
+        self._store.close()
 
     def get(self, key, default=None):
         if key in self.cache:
             return self.cache[key]
-        if key in self._store:
-            value = pickle.loads(self._store[key])
+
+        value = self._store.get(key, None)
+        if value is not None:
+            value = pickle.loads(value)
             self.cache[key] = value
             return value
+
         return default
 
     def put(self, key, val):
-        self._store[key] = pickle.dumps(val)
+        self._store.put(key, pickle.dumps(val))
         self.cache[key] = val
 
     def remove(self, key):
@@ -50,7 +53,7 @@ class HandleStore:
 
         res = self.get(key)
         if res is not None:
-            del self._store[key]
+            self._store.delete(key)
 
         return res
 
@@ -61,13 +64,20 @@ class HandleStore:
         self.put('l_' + _hash_path, [])
 
     def _create_connections(self, db_path):
-        self._store = UnQLite(db_path)
+        self._store = db.DB()
+        self._store.open(db_path, None, db.DB_HASH, db.DB_CREATE)
         self.cache = pylru.lrucache(CACHE_SIZE)
 
     def _pre_populate_cache(self):
         i = 0
-        for (key, val) in self._store:
-            self.cache[key] = pickle.loads(val)
+        cursor = self._store.cursor()
+
+        n = cursor.next()
+        while n is not None:
+            self.cache[n[0]] = pickle.loads(n[1])
+            n = cursor.next()
             i += 1
             if i >= CACHE_SIZE:
                 break
+
+        cursor.close()
